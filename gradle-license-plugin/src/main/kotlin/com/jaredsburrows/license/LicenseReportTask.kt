@@ -186,22 +186,60 @@ internal open class LicenseReportTask : DefaultTask() {
       .filter { configurationList.contains(it.name) }
       .forEach { configurationSet += it }
 
-    // Resolve the POM artifacts
-    configurationSet
-      .asSequence()
-      .filter { it.isCanBeResolved }
-      .map { it.resolvedConfiguration }
-      .map { it.lenientConfiguration }
-      .map { it.allModuleDependencies }
-      .flatMap { getResolvedArtifactsFromResolvedDependencies(it) }
-      .toList()
-      .forEach { artifact ->
-        val id = artifact.moduleVersion.id
-        val gav = "${id.group}:${id.name}:${id.version}@pom"
-        configurations
-          .getByName(pomConfiguration)
-          .dependencies += project.dependencies.add(pomConfiguration, gav)
+    val pomConfig = configurations.getByName(pomConfiguration)
+
+    // Prefer the modern resolutionResult API (works reliably on Gradle 9+).
+    // Fall back to the older resolvedConfiguration path for older Gradle versions.
+    configurationSet.forEach { configuration ->
+      try {
+        val gavs = try {
+          configuration.incoming.resolutionResult.allComponents
+            .mapNotNull { comp ->
+              (comp.id as? org.gradle.api.artifacts.component.ModuleComponentIdentifier)?.let { id ->
+                "${id.group}:${id.module}:${id.version}@pom"
+              }
+            }
+            .distinct()
+        } catch (e: Throwable) {
+          // resolutionResult may not be available or may fail in some environments
+          logger.debug("resolutionResult unavailable for configuration '${configuration.name}': ${e.message}")
+          emptyList()
+        }
+
+        if (gavs.isNotEmpty()) {
+          gavs.forEach { gav ->
+            project.dependencies.add(pomConfig.name, gav)
+          }
+          return@forEach
+        }
+      } catch (e: Exception) {
+        logger.debug("Error while using resolutionResult for '${configuration.name}': ${e.message}")
       }
+
+      // Fallback: old resolvedConfiguration-based approach (kept for compatibility).
+      try {
+        if (configuration.isCanBeResolved) {
+          val resolvedDeps = configuration
+            .resolvedConfiguration
+            .lenientConfiguration
+            .allModuleDependencies // Set<ResolvedDependency>
+
+          // Collect resolved artifacts from the entire set
+          val artifacts = getResolvedArtifactsFromResolvedDependencies(resolvedDeps)
+
+          artifacts.forEach { artifact ->
+            val id = artifact.moduleVersion.id
+            val gav = "${id.group}:${id.name}:${id.version}@pom"
+            project.dependencies.add(pomConfig.name, gav)
+          }
+        } else {
+          logger.debug("Configuration '${configuration.name}' cannot be resolved; skipping.")
+        }
+      } catch (ex: Exception) {
+        logger.warn("Failed to resolve configuration ${configuration.name}: ${ex.shortMessage()}")
+        logger.debug("Failed to resolve configuration ${configuration.name}", ex)
+      }
+    }
   }
 
   /** Get POM information from the dependency artifacts. */
